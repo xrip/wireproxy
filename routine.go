@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math/rand"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/things-go/go-socks5"
 	"github.com/things-go/go-socks5/bufferpool"
+	"github.com/things-go/go-socks5/statute"
 
 	"net/netip"
 
@@ -155,6 +157,146 @@ func (d VirtualTun) resolveToAddrPort(endpoint *addressPort) (*netip.AddrPort, e
 	return &addrPort, nil
 }
 
+// makeAssociateHandler creates a custom UDP ASSOCIATE handler that binds to the
+// TCP connection's local address instead of 0.0.0.0, fixing the BND.ADDR issue
+// where clients can't handle 0.0.0.0:port in the reply.
+func makeAssociateHandler(vt *VirtualTun, bufferPool bufferpool.BufPool) func(ctx context.Context, writer io.Writer, request *socks5.Request) error {
+	return func(ctx context.Context, writer io.Writer, request *socks5.Request) error {
+		// Extract listen IP from the TCP connection's local address
+		localTCPAddr, ok := request.LocalAddr.(*net.TCPAddr)
+		if !ok {
+			errorLogger.Printf("UDP Associate: failed to get local TCP address: %v\n", request.LocalAddr)
+			if err := socks5.SendReply(writer, statute.RepServerFailure, nil); err != nil {
+				return err
+			}
+			return errors.New("failed to get local TCP address")
+		}
+
+		// Bind to the same IP as the TCP listener, not 0.0.0.0
+		bindAddr := &net.UDPAddr{IP: localTCPAddr.IP, Port: 0}
+		bindLn, err := net.ListenUDP("udp", bindAddr)
+		if err != nil {
+			errorLogger.Printf("UDP Associate: failed to listen on %v: %v\n", bindAddr, err)
+			if err := socks5.SendReply(writer, statute.RepServerFailure, nil); err != nil {
+				return err
+			}
+			return fmt.Errorf("listen udp failed: %w", err)
+		}
+
+		// Send BND.ADDR reply with actual listen address (not 0.0.0.0)
+		if err := socks5.SendReply(writer, statute.RepSuccess, bindLn.LocalAddr()); err != nil {
+			bindLn.Close()
+			return fmt.Errorf("failed to send reply: %w", err)
+		}
+
+		// Spawn goroutine for UDP relay
+		go func() {
+			conns := sync.Map{}
+			buf := bufferPool.Get()
+			defer func() {
+				bufferPool.Put(buf)
+				bindLn.Close()
+				conns.Range(func(key, value any) bool {
+					if connTarget, ok := value.(net.Conn); ok {
+						connTarget.Close()
+					}
+					return true
+				})
+			}()
+
+			for {
+				n, srcAddr, err := bindLn.ReadFromUDP(buf[:cap(buf)])
+				if err != nil {
+					if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+						return
+					}
+					continue
+				}
+
+				pk, err := statute.ParseDatagram(buf[:n])
+				if err != nil {
+					continue
+				}
+
+				// Validate source address matches the associate request
+				srcEqual := (request.DestAddr.IP.IsUnspecified() || request.DestAddr.IP.Equal(srcAddr.IP)) &&
+					(request.DestAddr.Port == 0 || request.DestAddr.Port == srcAddr.Port)
+				if !srcEqual {
+					continue
+				}
+
+				connKey := srcAddr.String() + "--" + pk.DstAddr.String()
+
+				if target, ok := conns.Load(connKey); !ok {
+					// Dial through WireGuard tunnel using vt.Tnet.DialContext
+					targetNew, err := vt.Tnet.DialContext(ctx, "udp", pk.DstAddr.String())
+					if err != nil {
+						errorLogger.Printf("UDP Associate: dial to %v failed: %v\n", pk.DstAddr, err)
+						continue
+					}
+					conns.Store(connKey, targetNew)
+
+					// Read from remote and write back to client
+					go func() {
+						buf := bufferPool.Get()
+						defer func() {
+							targetNew.Close()
+							conns.Delete(connKey)
+							bufferPool.Put(buf)
+						}()
+
+						for {
+							n, err := targetNew.Read(buf[:cap(buf)])
+							if err != nil {
+								if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+									return
+								}
+								errorLogger.Printf("UDP Associate: read from remote %s failed: %v\n", targetNew.RemoteAddr(), err)
+								return
+							}
+
+							tmpBuf := bufferPool.Get()
+							tmpBuf = append(tmpBuf, pk.Header()...)
+							tmpBuf = append(tmpBuf, buf[:n]...)
+							if _, err := bindLn.WriteTo(tmpBuf, srcAddr); err != nil {
+								bufferPool.Put(tmpBuf)
+								errorLogger.Printf("UDP Associate: write to client %s failed: %v\n", srcAddr, err)
+								return
+							}
+							bufferPool.Put(tmpBuf)
+						}
+					}()
+
+					if _, err := targetNew.Write(pk.Data); err != nil {
+						errorLogger.Printf("UDP Associate: write to remote %s failed: %v\n", targetNew.RemoteAddr(), err)
+						return
+					}
+				} else {
+					if _, err := target.(net.Conn).Write(pk.Data); err != nil {
+						errorLogger.Printf("UDP Associate: write to remote %s failed: %v\n", target.(net.Conn).RemoteAddr(), err)
+						return
+					}
+				}
+			}
+		}()
+
+		// Wait for TCP control connection to close
+		buf := bufferPool.Get()
+		defer bufferPool.Put(buf)
+
+		for {
+			_, err := request.Reader.Read(buf[:cap(buf)])
+			if err != nil {
+				bindLn.Close()
+				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+}
+
 // SpawnRoutine spawns a socks5 server.
 func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 	var authMethods []socks5.Authenticator
@@ -166,11 +308,13 @@ func (config *Socks5Config) SpawnRoutine(vt *VirtualTun) {
 		authMethods = append(authMethods, socks5.NoAuthAuthenticator{})
 	}
 
+	bufferPool := bufferpool.NewPool(256 * 1024)
 	options := []socks5.Option{
 		socks5.WithDial(vt.Tnet.DialContext),
 		socks5.WithResolver(vt),
 		socks5.WithAuthMethods(authMethods),
-		socks5.WithBufferPool(bufferpool.NewPool(256 * 1024)),
+		socks5.WithBufferPool(bufferPool),
+		socks5.WithAssociateHandle(makeAssociateHandler(vt, bufferPool)),
 	}
 
 	server := socks5.NewServer(options...)
